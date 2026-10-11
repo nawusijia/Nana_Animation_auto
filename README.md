@@ -6,6 +6,12 @@
 >
 > 剧本分析、Scene、Shot、Sequence、H3 Prompt 与审核由你正在使用的本地 Agent 接管；本仓库负责项目状态、确定性校验、资产门禁、H3 工作流、ComfyUI 队列、关系帧连续性与结果归档。
 
+## 新增：两份可独立使用的娜娜剧作 Skills
+
+现已开放 **[故事大纲 Skill](skills/story-outline/SKILL.md)** 与 **[完整剧本 Skill](skills/screenplay-writing/SKILL.md)**：可让本地 Agent 先创作/改编故事大纲，再把已确认大纲编译为完整逐字剧本。两份均可单独使用，不要求安装 H3 或配置大模型 API Key。
+
+使用方法、原创/改编示例、与 H3 工作流的衔接说明见 **[剧作 Skills 使用指南](skills/README.md)**。它们是可选的剧本创作前置工具，**不修改本 H3 开源版现有的 Agent 阶段 API 或运行规则**。
+
 核心流程：
 
 ```text
