@@ -84,6 +84,23 @@ For each stage:
 
 Do not skip stages. Do not maintain a second UI-only state file. The server projects accepted artifacts into the H3 workspace.
 
+### Minimal and scoped context
+
+`GET /api/agent/context/:stage` returns only what that stage needs (under `context`), not the whole workflow. The rules, validators and artifact shapes are unchanged. `bootstrap.stage.contextScopes` lists the URLs for the current stage.
+
+| Stage | Unscoped `context` | Scoped |
+| --- | --- | --- |
+| `outline` | `sourceText`, `scriptMode`, `isOtome` | — |
+| `assets` | `settings` + `sceneOutlines` (with `rawText`) | — |
+| `shots` | `workItems[]` index of Scenes | `?sceneId=` → that Scene's `rawText`, Scene list, slim asset catalog (id/name/kind/short description), `style` |
+| `sequences` | compact Shots (id, sceneId, order, durationSeconds, speech, short action/endState, ids) + `workItems[]` + duration limits | `?sceneId=` → only that Scene's Shots |
+| `prompts` | `workItems[]` index of Sequences + `style` + required Director Read / audit field names | `?sequenceId=` → the Sequence, its own Shots (full direction + speech), referenced assets (id/name/kind), previous same-Scene Sequence end state |
+| `reviewer` | Scene/Shot coverage, asset list, `unassignedShotIds`, `workItems[]` | `?sequenceId=` → Scene `rawText`, Shots (source/speech/durations/direction), Prompt, Director Read, audit, end state |
+
+For multi-item stages, fetch the unscoped index first, then each `workItems[].contextUrl` one at a time. **Still submit one complete artifact for the whole stage** (all Scenes / all Sequences) to the completion API; validators check the whole stage at once.
+
+`?full=1` returns the legacy full payload (`workflow`, `policy`, …) for debugging only. Do not use it in normal runs.
+
 ## 3. Planning stages
 
 ### `outline`

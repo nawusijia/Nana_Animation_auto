@@ -426,6 +426,7 @@ async function buildH3AgentBootstrap(runtime) {
       id: nextStage,
       contract: h3AgentStageContract(nextStage),
       contextApi: nextStage === 'script' ? null : `/api/agent/context/${nextStage}`,
+      contextScopes: h3AgentContextScopes(nextStage),
       delivery: nextStage === 'execution' || nextStage === 'script' ? null : {
         completionApi: `/api/agent/pipeline/${nextStage}`,
         method: 'PUT',
@@ -438,6 +439,338 @@ async function buildH3AgentBootstrap(runtime) {
       scenes: workflow?.outline?.sceneOutlines?.length || 0,
       shots: workflow?.shots?.length || 0,
       sequences: workflow?.sequences?.length || 0,
+      prompts: Object.keys(workflow?.prompts || {}).length,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Minimal per-stage Agent context.
+// GET /api/agent/context/:stage returns only what the stage needs; the stage
+// rules/validators are unchanged. ?sceneId= / ?sequenceId= narrow the context to
+// one work item, and ?full=1 returns the legacy full workflow payload.
+// ---------------------------------------------------------------------------
+
+const H3_AGENT_SCOPED_STAGES = Object.freeze({
+  shots: 'sceneId',
+  sequences: 'sceneId',
+  prompts: 'sequenceId',
+  reviewer: 'sequenceId',
+});
+
+function h3AgentContextUrl(stage, params = {}) {
+  const query = new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== ''));
+  const suffix = query.toString();
+  return `/api/agent/context/${stage}${suffix ? `?${suffix}` : ''}`;
+}
+
+function h3AgentContextScopes(stage) {
+  if (!stage || stage === 'script') return null;
+  const scopeParam = H3_AGENT_SCOPED_STAGES[stage] || null;
+  return {
+    minimal: h3AgentContextUrl(stage),
+    scopeParam,
+    scoped: scopeParam ? `${h3AgentContextUrl(stage)}?${scopeParam}={id}` : null,
+    full: h3AgentContextUrl(stage, { full: 1 }),
+    note: scopeParam
+      ? `Unscoped context returns this stage's contract plus workItems[] (each with contextUrl). Fetch one ${scopeParam} at a time, then submit ONE complete artifact covering every work item to the completion API. ?full=1 is for debugging only.`
+      : 'Context is already minimal for this stage. ?full=1 returns the legacy full workflow for debugging only.',
+  };
+}
+
+function h3AgentShortText(value, max = 160) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function h3AgentWorkflowMeta(workflow) {
+  return {
+    scriptMode: String(workflow?.scriptMode || 'original'),
+    isOtome: Boolean(workflow?.isOtome),
+  };
+}
+
+function h3AgentSettings(workflow) {
+  return workflow?.settings || workflow?.outline?.settings || null;
+}
+
+function h3AgentSlimAssetRecords(records, kind) {
+  return (Array.isArray(records) ? records : []).map(item => ({
+    id: String(item?.id || ''),
+    name: String(item?.name || ''),
+    kind,
+    description: h3AgentShortText(item?.description || item?.prompt || ''),
+  }));
+}
+
+function h3AgentSlimSettings(workflow) {
+  const settings = h3AgentSettings(workflow) || {};
+  return {
+    overview: String(settings.overview || ''),
+    style: String(settings.style || ''),
+    characters: h3AgentSlimAssetRecords(settings.characters, 'character'),
+    scenes: h3AgentSlimAssetRecords(settings.scenes, 'scene'),
+    assets: h3AgentSlimAssetRecords(settings.assets, 'asset'),
+  };
+}
+
+function h3AgentAssetIndex(workflow) {
+  const settings = h3AgentSettings(workflow) || {};
+  const index = new Map();
+  for (const [bucket, kind] of [['characters', 'character'], ['scenes', 'scene'], ['assets', 'asset']]) {
+    for (const item of Array.isArray(settings[bucket]) ? settings[bucket] : []) {
+      const id = String(item?.id || '');
+      if (id && !index.has(id)) index.set(id, { id, name: String(item?.name || ''), kind });
+    }
+  }
+  return index;
+}
+
+function h3AgentSceneOutlines(workflow) {
+  return Array.isArray(workflow?.outline?.sceneOutlines) ? workflow.outline.sceneOutlines : [];
+}
+
+function h3AgentSceneHeader(scene) {
+  return { id: String(scene?.id || ''), title: String(scene?.title || ''), locationId: scene?.locationId ?? null };
+}
+
+function h3AgentSortedSequences(workflow) {
+  return (Array.isArray(workflow?.sequences) ? workflow.sequences : [])
+    .map((sequence, index) => ({ sequence, index }))
+    .sort((a, b) => String(a.sequence.sceneId || '').localeCompare(String(b.sequence.sceneId || ''))
+      || (Number(a.sequence.order) || 0) - (Number(b.sequence.order) || 0)
+      || a.index - b.index)
+    .map(item => item.sequence);
+}
+
+function h3AgentSequenceShots(workflow, sequence) {
+  const shots = Array.isArray(workflow?.shots) ? workflow.shots : [];
+  return (sequence?.shotIds || []).map(id => shots.find(shot => String(shot.id) === String(id))).filter(Boolean);
+}
+
+function h3AgentPreviousSameSceneSequence(workflow, sequence) {
+  const sameScene = h3AgentSortedSequences(workflow).filter(item => String(item.sceneId || '') === String(sequence.sceneId || ''));
+  const position = sameScene.findIndex(item => String(item.id) === String(sequence.id));
+  return position > 0 ? sameScene[position - 1] : null;
+}
+
+function h3AgentSequenceHeader(workflow, sequence) {
+  return {
+    id: String(sequence.id),
+    sceneId: String(sequence.sceneId || ''),
+    order: sequence.order ?? null,
+    title: String(sequence.title || ''),
+    durationSeconds: sequence.durationSeconds ?? null,
+    shotIds: Array.isArray(sequence.shotIds) ? sequence.shotIds.map(String) : [],
+    assetIds: Array.isArray(sequence.assetIds) ? sequence.assetIds.map(String) : [],
+  };
+}
+
+function h3AgentReferencedAssets(workflow, sequence, sequenceShots) {
+  const index = h3AgentAssetIndex(workflow);
+  const ids = [...new Set([
+    ...(sequence.assetIds || []),
+    ...sequenceShots.flatMap(shot => [...(shot.characterIds || []), ...(shot.assetIds || [])]),
+  ].map(String))];
+  return ids.map(id => index.get(id) || { id, name: '', kind: 'unknown' });
+}
+
+// Keeps every agent-authored Shot field except values already implied by the
+// enclosing Sequence (sceneId/sequenceId) or duplicated (description == sourceText).
+function h3AgentPromptShot(shot) {
+  const { sceneId, sequenceId, sequenceIds, videoPrompt, legacyIds, sourceFingerprint, legacyUnclassifiedSpeech, ...rest } = shot || {};
+  if (rest.description !== undefined && String(rest.description) === String(rest.sourceText || '')) delete rest.description;
+  return rest;
+}
+
+function h3AgentNotFound(message) {
+  return Object.assign(new Error(message), { status: 404 });
+}
+
+function buildH3AgentStageContext(stage, workflow, query = {}) {
+  const meta = h3AgentWorkflowMeta(workflow);
+  const scopeParam = H3_AGENT_SCOPED_STAGES[stage] || null;
+  const scopeId = scopeParam ? String(query[scopeParam] || '').trim() : '';
+  const scenes = h3AgentSceneOutlines(workflow);
+  const shots = Array.isArray(workflow?.shots) ? workflow.shots : [];
+
+  if (stage === 'outline') {
+    return { ...meta, sourceText: String(workflow?.sourceText || '') };
+  }
+
+  if (stage === 'assets') {
+    return {
+      ...meta,
+      settings: h3AgentSettings(workflow),
+      sceneOutlines: scenes,
+    };
+  }
+
+  if (stage === 'shots') {
+    if (!scopeId) {
+      return {
+        ...meta,
+        scope: 'index',
+        workItems: scenes.map(scene => ({
+          ...h3AgentSceneHeader(scene),
+          sourceChars: String(scene.rawText || '').length,
+          contextUrl: h3AgentContextUrl(stage, { sceneId: scene.id }),
+        })),
+      };
+    }
+    const scene = scenes.find(item => String(item.id) === scopeId);
+    if (!scene) throw h3AgentNotFound(`未知 sceneId：${scopeId}`);
+    return {
+      ...meta,
+      scope: { sceneId: scopeId },
+      settings: h3AgentSlimSettings(workflow),
+      scenes: scenes.map(h3AgentSceneHeader),
+      scene: { ...h3AgentSceneHeader(scene), rawText: String(scene.rawText || '') },
+    };
+  }
+
+  if (stage === 'sequences') {
+    const compactShot = shot => ({
+      id: String(shot.id),
+      sceneId: String(shot.sceneId || ''),
+      order: shot.order ?? null,
+      durationSeconds: shot.durationSeconds ?? null,
+      speech: Array.isArray(shot.speech) ? shot.speech : [],
+      direction: {
+        action: h3AgentShortText(shot.direction?.action || shot.description || shot.sourceText || ''),
+        endState: h3AgentShortText(shot.direction?.endState || ''),
+      },
+      characterIds: Array.isArray(shot.characterIds) ? shot.characterIds : [],
+      assetIds: Array.isArray(shot.assetIds) ? shot.assetIds : [],
+    });
+    const limits = { minSeconds: H3_MIN_SECONDS, maxSeconds: configuredSequenceMaxSeconds(), integerSeconds: true };
+    if (scopeId && !scenes.some(scene => String(scene.id) === scopeId)) throw h3AgentNotFound(`未知 sceneId：${scopeId}`);
+    const selected = scopeId ? shots.filter(shot => String(shot.sceneId || '') === scopeId) : shots;
+    return {
+      ...meta,
+      scope: scopeId ? { sceneId: scopeId } : 'all',
+      sequenceLimits: limits,
+      workItems: scopeId ? undefined : scenes.map(scene => ({
+        ...h3AgentSceneHeader(scene),
+        shotCount: shots.filter(shot => String(shot.sceneId || '') === String(scene.id)).length,
+        contextUrl: h3AgentContextUrl(stage, { sceneId: scene.id }),
+      })),
+      shots: selected.map(compactShot),
+    };
+  }
+
+  if (stage === 'prompts') {
+    const sequences = h3AgentSortedSequences(workflow);
+    if (!scopeId) {
+      return {
+        ...meta,
+        scope: 'index',
+        style: String(h3AgentSettings(workflow)?.style || ''),
+        requiredFields: { directorRead: DIRECTOR_READ_FIELDS, generationAudit: GENERATION_AUDIT_FIELDS },
+        workItems: sequences.map(sequence => ({
+          id: String(sequence.id),
+          sceneId: String(sequence.sceneId || ''),
+          order: sequence.order ?? null,
+          title: String(sequence.title || ''),
+          durationSeconds: sequence.durationSeconds ?? null,
+          shotCount: (sequence.shotIds || []).length,
+          hasPrompt: Boolean(String(workflow?.prompts?.[sequence.id] || '').trim()),
+          contextUrl: h3AgentContextUrl(stage, { sequenceId: sequence.id }),
+        })),
+      };
+    }
+    const sequence = sequences.find(item => String(item.id) === scopeId);
+    if (!sequence) throw h3AgentNotFound(`未知 sequenceId：${scopeId}`);
+    const sequenceShots = h3AgentSequenceShots(workflow, sequence);
+    const previous = h3AgentPreviousSameSceneSequence(workflow, sequence);
+    const previousShots = previous ? h3AgentSequenceShots(workflow, previous) : [];
+    const scene = scenes.find(item => String(item.id) === String(sequence.sceneId || ''));
+    const existing = {
+      prompt: workflow?.prompts?.[sequence.id],
+      directorRead: workflow?.directorReads?.[sequence.id],
+      generationAudit: workflow?.generationAudits?.[sequence.id],
+      endState: workflow?.sequenceEndStates?.[sequence.id],
+    };
+    const hasExisting = Object.values(existing).some(value => value !== undefined && value !== null && value !== '');
+    return {
+      ...meta,
+      scope: { sequenceId: scopeId },
+      style: String(h3AgentSettings(workflow)?.style || ''),
+      scene: scene ? h3AgentSceneHeader(scene) : { id: String(sequence.sceneId || '') },
+      sequence: h3AgentSequenceHeader(workflow, sequence),
+      shots: sequenceShots.map(h3AgentPromptShot),
+      assets: h3AgentReferencedAssets(workflow, sequence, sequenceShots),
+      previousSameSceneSequence: previous ? {
+        id: String(previous.id),
+        title: String(previous.title || ''),
+        endState: workflow?.sequenceEndStates?.[previous.id] || null,
+        lastShotEndState: String(previousShots.at(-1)?.direction?.endState || '') || null,
+      } : null,
+      existing: hasExisting ? existing : undefined,
+    };
+  }
+
+  if (stage === 'reviewer') {
+    const sequences = h3AgentSortedSequences(workflow);
+    if (!scopeId) {
+      const assigned = new Set(sequences.flatMap(sequence => (sequence.shotIds || []).map(String)));
+      return {
+        ...meta,
+        scope: 'index',
+        scenes: scenes.map(scene => ({
+          ...h3AgentSceneHeader(scene),
+          shotIds: shots.filter(shot => String(shot.sceneId || '') === String(scene.id)).map(shot => String(shot.id)),
+        })),
+        assets: [...h3AgentAssetIndex(workflow).values()],
+        unassignedShotIds: shots.map(shot => String(shot.id)).filter(id => !assigned.has(id)),
+        workItems: sequences.map(sequence => ({
+          ...h3AgentSequenceHeader(workflow, sequence),
+          hasPrompt: Boolean(String(workflow?.prompts?.[sequence.id] || '').trim()),
+          hasDirectorRead: Boolean(workflow?.directorReads?.[sequence.id]),
+          hasGenerationAudit: Boolean(workflow?.generationAudits?.[sequence.id]),
+          contextUrl: h3AgentContextUrl(stage, { sequenceId: sequence.id }),
+        })),
+      };
+    }
+    const sequence = sequences.find(item => String(item.id) === scopeId);
+    if (!sequence) throw h3AgentNotFound(`未知 sequenceId：${scopeId}`);
+    const sequenceShots = h3AgentSequenceShots(workflow, sequence);
+    const scene = scenes.find(item => String(item.id) === String(sequence.sceneId || ''));
+    const previous = h3AgentPreviousSameSceneSequence(workflow, sequence);
+    return {
+      ...meta,
+      scope: { sequenceId: scopeId },
+      scene: scene ? { ...h3AgentSceneHeader(scene), rawText: String(scene.rawText || '') } : { id: String(sequence.sceneId || '') },
+      sequence: h3AgentSequenceHeader(workflow, sequence),
+      shots: sequenceShots.map(shot => ({
+        id: String(shot.id),
+        order: shot.order ?? null,
+        durationSeconds: shot.durationSeconds ?? null,
+        sourceText: String(shot.sourceText || shot.description || ''),
+        speech: Array.isArray(shot.speech) ? shot.speech : [],
+        direction: shot.direction || {},
+        characterIds: Array.isArray(shot.characterIds) ? shot.characterIds : [],
+        assetIds: Array.isArray(shot.assetIds) ? shot.assetIds : [],
+      })),
+      assets: h3AgentReferencedAssets(workflow, sequence, sequenceShots),
+      prompt: workflow?.prompts?.[sequence.id] ?? null,
+      directorRead: workflow?.directorReads?.[sequence.id] ?? null,
+      generationAudit: workflow?.generationAudits?.[sequence.id] ?? null,
+      endState: workflow?.sequenceEndStates?.[sequence.id] ?? null,
+      previousSameSceneSequence: previous ? {
+        id: String(previous.id),
+        endState: workflow?.sequenceEndStates?.[previous.id] || null,
+      } : null,
+    };
+  }
+
+  // execution: planning is committed; only a summary is useful.
+  return {
+    ...meta,
+    summary: {
+      scenes: scenes.length,
+      shots: shots.length,
+      sequences: Array.isArray(workflow?.sequences) ? workflow.sequences.length : 0,
       prompts: Object.keys(workflow?.prompts || {}).length,
     },
   };
@@ -3459,13 +3792,35 @@ async function handleApi(req, res, url) {
     if (stage !== pipeline.nextStage && !pipeline.completedStages.includes(stage)) {
       throw Object.assign(new Error(`当前合法 stage 是 ${pipeline.nextStage}，不能跳到 ${stage}。`), { status: 409 });
     }
+    const full = ['1', 'true'].includes(String(url.searchParams.get('full') || '').toLowerCase());
+    if (full) {
+      // Legacy/debug payload: the entire workflow object, unchanged.
+      sendJson(res, 200, {
+        project: { id: runtime.project.id, name: runtime.project.name, root: runtime.projectRoot },
+        policy: h3AgentPolicy(),
+        pipeline,
+        stage,
+        contract: h3AgentStageContract(stage),
+        workflow,
+      });
+      return;
+    }
+    const scopeParam = H3_AGENT_SCOPED_STAGES[stage];
+    const scoped = Boolean(scopeParam && String(url.searchParams.get(scopeParam) || '').trim());
     sendJson(res, 200, {
-      project: { id: runtime.project.id, name: runtime.project.name, root: runtime.projectRoot },
-      policy: h3AgentPolicy(),
-      pipeline,
+      kind: 'nana-h3-agent-stage-context',
+      contextMode: 'minimal',
+      project: { id: runtime.project.id, name: runtime.project.name },
       stage,
-      contract: h3AgentStageContract(stage),
-      workflow,
+      nextStage: pipeline.nextStage,
+      // A scoped work-item response omits the stage contract/scopes; they are in the unscoped index and bootstrap.
+      contract: scoped ? undefined : h3AgentStageContract(stage),
+      contextScopes: scoped ? undefined : h3AgentContextScopes(stage),
+      completionApi: H3_AGENT_PIPELINE_STAGES.includes(stage) ? `/api/agent/pipeline/${stage}` : null,
+      context: buildH3AgentStageContext(stage, workflow, {
+        sceneId: url.searchParams.get('sceneId'),
+        sequenceId: url.searchParams.get('sequenceId'),
+      }),
     });
     return;
   }

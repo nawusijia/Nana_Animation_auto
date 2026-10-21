@@ -266,6 +266,16 @@ outline
 → execution
 ```
 
+`/api/agent/context/:stage` 默认只返回**当前阶段需要的最小上下文**（放在 `context` 字段），不再整包返回 workflow，以减少本地 Agent 的 token 消耗：
+
+- `outline`：只给剧本原文；`assets`：只给大纲与设定；
+- `shots` / `sequences`：可加 `?sceneId=` 只取一个 Scene；
+- `prompts` / `reviewer`：不带参数时返回 Sequence 工作项索引（每项带 `contextUrl`），再用 `?sequenceId=` 逐条读取；
+- 分条读取后，仍需把整个阶段的完整 artifact **一次性**提交；
+- `?full=1` 返回旧版完整 workflow，仅用于调试 / 向后兼容。
+
+规则、校验器与产物格式均未改变；各阶段可用的 URL 见 bootstrap 的 `stage.contextScopes`，详细表格见 `AGENTS.md`。
+
 Agent 不能跳阶段。每个阶段通过：
 
 ```json
